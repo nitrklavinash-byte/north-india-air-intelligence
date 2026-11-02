@@ -18,7 +18,7 @@ from shapely.ops import unary_union
 app = FastAPI(
     title="North India Air Intelligence API",
     description="NASA FIRMS fire monitoring with geographic classification",
-    version="2.2.0"
+    version="2.3.0"
 )
 
 NASA_KEY = os.getenv("NASA_FIRMS_MAP_KEY")
@@ -36,6 +36,8 @@ SOURCES = {
     "SNPP": "VIIRS_SNPP_NRT"
 }
 
+# Custom Western UP monitoring region.
+# This is not an official administrative region.
 WEST_UP_DISTRICTS = {
     "Saharanpur", "Muzaffarnagar", "Shamli", "Meerut",
     "Baghpat", "Ghaziabad", "Gautam Buddha Nagar", "Hapur",
@@ -45,6 +47,17 @@ WEST_UP_DISTRICTS = {
     "Shahjahanpur", "Budaun"
 }
 
+# Historical district names mapped to current names.
+DISTRICT_ALIASES = {
+    "jyotiba phule nagar": "amroha",
+    "jyotiba phule nagar district": "amroha",
+    "mahamaya nagar": "hathras",
+    "kanshiram nagar": "kasganj",
+    "kanshi ram nagar": "kasganj",
+    "prabuddha nagar": "shamli",
+    "prabudh nagar": "shamli"
+}
+
 BOUNDARY_CACHE = None
 BOUNDARY_LOCK = Lock()
 
@@ -52,29 +65,51 @@ BOUNDARY_LOCK = Lock()
 def normalize_name(value):
     value = str(value or "").strip().casefold()
     value = unicodedata.normalize("NFKD", value)
+
     value = "".join(
         char for char in value
         if not unicodedata.combining(char)
     )
+
     return re.sub(r"[^a-z0-9]", "", value)
+
+
+def canonical_district_name(value):
+    normalized = normalize_name(value)
+
+    aliases = {
+        normalize_name(old_name): normalize_name(current_name)
+        for old_name, current_name in DISTRICT_ALIASES.items()
+    }
+
+    return aliases.get(normalized, normalized)
 
 
 def get_feature_name(properties):
     for key in (
-        "shapeName", "NAME_1", "NAME_2",
-        "name", "NAME", "admin"
+        "shapeName",
+        "NAME_1",
+        "NAME_2",
+        "name",
+        "NAME",
+        "admin"
     ):
         value = properties.get(key)
+
         if value:
             return str(value).strip()
+
     return ""
 
 
 def download_json(url):
     request = urllib.request.Request(
         url,
-        headers={"User-Agent": "NorthIndiaAirIntelligence/2.2"}
+        headers={
+            "User-Agent": "NorthIndiaAirIntelligence/2.3"
+        }
     )
+
     with urllib.request.urlopen(request, timeout=60) as response:
         return json.loads(response.read().decode("utf-8"))
 
@@ -95,7 +130,9 @@ def download_boundary(metadata_url):
     geojson = download_json(geojson_url)
 
     if not geojson.get("features"):
-        raise RuntimeError("Boundary GeoJSON contains no features.")
+        raise RuntimeError(
+            "Boundary GeoJSON contains no features."
+        )
 
     return metadata, geojson
 
@@ -107,6 +144,7 @@ def load_region_geometries():
         return BOUNDARY_CACHE
 
     with BOUNDARY_LOCK:
+
         if BOUNDARY_CACHE is not None:
             return BOUNDARY_CACHE
 
@@ -114,9 +152,11 @@ def load_region_geometries():
             india_meta, india_data = download_boundary(
                 GEOBOUNDARIES["india_states"]
             )
+
             pakistan_meta, pakistan_data = download_boundary(
                 GEOBOUNDARIES["pakistan_provinces"]
             )
+
             districts_meta, districts_data = download_boundary(
                 GEOBOUNDARIES["india_districts"]
             )
@@ -125,7 +165,7 @@ def load_region_geometries():
             state_geometries = {}
             available_state_names = []
 
-            # Load Indian state boundaries.
+            # 1. Load Indian state and union territory boundaries.
             for feature in india_data["features"]:
                 properties = feature.get("properties", {})
                 state_name = get_feature_name(properties)
@@ -138,9 +178,9 @@ def load_region_geometries():
                 state_geometries[normalized] = shape(
                     feature["geometry"]
                 )
+
                 available_state_names.append(state_name)
 
-            # Flexible state-name matching.
             state_mapping = {
                 "punjab": "Indian Punjab",
                 "haryana": "Haryana",
@@ -158,7 +198,7 @@ def load_region_geometries():
                 if geometry is not None:
                     regions[region_name] = geometry
 
-            # Load Pakistan Punjab.
+            # 2. Load Pakistan Punjab.
             for feature in pakistan_data["features"]:
                 properties = feature.get("properties", {})
                 province_name = get_feature_name(properties)
@@ -169,49 +209,68 @@ def load_region_geometries():
                     )
                     break
 
-            # Find Uttar Pradesh polygon.
+            # 3. Find Uttar Pradesh state polygon.
             up_geometry = state_geometries.get(
                 normalize_name("Uttar Pradesh")
             )
 
-            # Western UP district union.
+            if up_geometry is None:
+                raise RuntimeError(
+                    "Uttar Pradesh state boundary was not found. "
+                    "Available state names: "
+                    + ", ".join(sorted(available_state_names))
+                )
+
+            # 4. Build Western UP from selected district polygons.
+            requested_names = {
+                normalize_name(name): name
+                for name in WEST_UP_DISTRICTS
+            }
+
             matched_districts = {}
             missing_districts = set(WEST_UP_DISTRICTS)
+            observed_candidate_names = set()
 
-            if up_geometry is not None:
-                requested_names = {
-                    normalize_name(name): name
-                    for name in WEST_UP_DISTRICTS
-                }
+            for feature in districts_data["features"]:
+                properties = feature.get("properties", {})
+                district_name = get_feature_name(properties)
 
-                for feature in districts_data["features"]:
-                    properties = feature.get("properties", {})
-                    district_name = get_feature_name(properties)
+                if not district_name or not feature.get("geometry"):
+                    continue
 
-                    if not district_name or not feature.get("geometry"):
-                        continue
+                canonical_name = canonical_district_name(
+                    district_name
+                )
 
-                    normalized = normalize_name(district_name)
+                if canonical_name not in requested_names:
+                    continue
 
-                    if normalized not in requested_names:
-                        continue
+                district_geometry = shape(feature["geometry"])
 
-                    district_geometry = shape(feature["geometry"])
-                    clipped = district_geometry.intersection(up_geometry)
+                # Clip to UP boundary to avoid matching another state.
+                clipped_geometry = district_geometry.intersection(
+                    up_geometry
+                )
 
-                    if clipped.is_empty or clipped.area <= 0:
-                        continue
+                if clipped_geometry.is_empty:
+                    continue
 
-                    requested_name = requested_names[normalized]
-                    matched_districts[requested_name] = clipped
-                    missing_districts.discard(requested_name)
+                if clipped_geometry.area <= 0:
+                    continue
+
+                requested_name = requested_names[canonical_name]
+
+                matched_districts[requested_name] = clipped_geometry
+                missing_districts.discard(requested_name)
+
+                observed_candidate_names.add(district_name)
 
             if matched_districts:
                 regions["Western Uttar Pradesh"] = unary_union(
                     list(matched_districts.values())
                 )
 
-            # Required regions.
+            # 5. Verify all required regions.
             required_regions = {
                 "Indian Punjab",
                 "Haryana",
@@ -237,6 +296,10 @@ def load_region_geometries():
                     )
                     + ". Available original state names: "
                     + ", ".join(sorted(available_state_names))
+                    + ". Matched Western UP districts: "
+                    + ", ".join(sorted(matched_districts))
+                    + ". Missing Western UP districts: "
+                    + ", ".join(sorted(missing_districts))
                 )
 
             BOUNDARY_CACHE = {
@@ -246,6 +309,9 @@ def load_region_geometries():
                 ),
                 "missing_western_up_districts": sorted(
                     missing_districts
+                ),
+                "observed_western_up_names": sorted(
+                    observed_candidate_names
                 ),
                 "metadata": {
                     "source": "geoBoundaries",
@@ -272,6 +338,7 @@ def load_region_geometries():
 def assign_region(latitude, longitude, geometries):
     point = Point(longitude, latitude)
 
+    # Deterministic priority for shared boundary points.
     priority = [
         "Delhi NCR",
         "Indian Punjab",
@@ -296,7 +363,7 @@ def root():
     return {
         "message": "North India Air Intelligence API",
         "status": "operational",
-        "version": "2.2.0",
+        "version": "2.3.0",
         "documentation": "/docs",
         "live_data": "/api/fires"
     }
@@ -333,17 +400,30 @@ def get_regions():
                 for name in data["regions"]
             ],
             "western_up": {
+                "expected_district_count": len(WEST_UP_DISTRICTS),
+                "matched_district_count": len(
+                    data["matched_western_up_districts"]
+                ),
+                "missing_district_count": len(
+                    data["missing_western_up_districts"]
+                ),
                 "matched_districts": data[
                     "matched_western_up_districts"
                 ],
                 "missing_districts": data[
                     "missing_western_up_districts"
+                ],
+                "observed_dataset_names": data[
+                    "observed_western_up_names"
                 ]
             }
         }
 
     except Exception as error:
-        raise HTTPException(status_code=503, detail=str(error))
+        raise HTTPException(
+            status_code=503,
+            detail=str(error)
+        )
 
 
 @app.get("/api/fires")
@@ -373,6 +453,7 @@ def get_fires(
     try:
         boundary_data = load_region_geometries()
         geometries = boundary_data["regions"]
+
     except Exception as error:
         raise HTTPException(
             status_code=503,
@@ -390,7 +471,9 @@ def get_fires(
     try:
         request = urllib.request.Request(
             url,
-            headers={"User-Agent": "NorthIndiaAirIntelligence/2.2"}
+            headers={
+                "User-Agent": "NorthIndiaAirIntelligence/2.3"
+            }
         )
 
         with urllib.request.urlopen(request, timeout=45) as response:
@@ -399,8 +482,12 @@ def get_fires(
         reader = csv.DictReader(io.StringIO(content))
 
         required_columns = {
-            "latitude", "longitude", "confidence",
-            "acq_date", "acq_time", "frp"
+            "latitude",
+            "longitude",
+            "confidence",
+            "acq_date",
+            "acq_time",
+            "frp"
         }
 
         if not reader.fieldnames or not required_columns.issubset(
@@ -439,11 +526,13 @@ def get_fires(
             ).strip().lower()
 
             confidence = confidence_map.get(
-                confidence_code, "unknown"
+                confidence_code,
+                "unknown"
             )
 
             if min_confidence == "nominal" and confidence not in (
-                "nominal", "high"
+                "nominal",
+                "high"
             ):
                 filtered_count += 1
                 continue
@@ -453,7 +542,9 @@ def get_fires(
                 continue
 
             region = assign_region(
-                latitude, longitude, geometries
+                latitude,
+                longitude,
+                geometries
             )
 
             if region is None:
@@ -502,13 +593,16 @@ def get_fires(
             status_code=502,
             detail=f"NASA FIRMS returned HTTP {error.code}."
         )
+
     except urllib.error.URLError:
         raise HTTPException(
             status_code=502,
             detail="Unable to connect to NASA FIRMS."
         )
+
     except HTTPException:
         raise
+
     except Exception:
         raise HTTPException(
             status_code=502,
