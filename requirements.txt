@@ -1,1 +1,2 @@
-fastapi[all]
+fastapi[standard]
+shapely==2.1.2
