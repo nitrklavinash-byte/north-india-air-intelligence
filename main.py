@@ -220,6 +220,7 @@ def get_fires(
             detail="NASA FIRMS request failed. Check server logs."
         )
 
+@app.get("/api/fires/summary")
 def fire_summary(
     days: int = Query(default=1, ge=1, le=5),
     satellite: str = Query(default="NOAA21")
