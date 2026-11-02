@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from threading import Lock
 
 from fastapi import FastAPI, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
 from shapely.geometry import shape, Point
 from shapely.ops import unary_union
 from shapely import make_valid
@@ -21,6 +22,14 @@ app = FastAPI(
     title="North India Air Intelligence API",
     description="NASA FIRMS fire monitoring with geographic classification",
     version=APP_VERSION
+)
+# Allow browser dashboards to access the public API.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["GET", "HEAD", "OPTIONS"],
+    allow_headers=["*"]
 )
 
 NASA_KEY = os.getenv("NASA_FIRMS_MAP_KEY")
