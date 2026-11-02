@@ -77,6 +77,7 @@ def get_region(latitude, longitude):
     return matches
 
 
+
 @app.get("/api/fires")
 def get_fires(
     days: int = Query(default=1, ge=1, le=5),
@@ -93,6 +94,12 @@ def get_fires(
         raise HTTPException(
             status_code=400,
             detail="Choose NOAA20, NOAA21 or SNPP."
+        )
+
+    if min_confidence not in ("low", "nominal", "high"):
+        raise HTTPException(
+            status_code=400,
+            detail="Confidence must be low, nominal or high."
         )
 
     # Combined North India monitoring bounding box
@@ -114,13 +121,36 @@ def get_fires(
             content = response.read().decode("utf-8")
 
         reader = csv.DictReader(io.StringIO(content))
+
+        required_columns = {
+            "latitude", "longitude", "confidence",
+            "acq_date", "acq_time", "frp"
+        }
+
+        if not reader.fieldnames or not required_columns.issubset(
+            set(reader.fieldnames)
+        ):
+            raise HTTPException(
+                status_code=502,
+                detail="NASA FIRMS returned an unexpected data format."
+            )
+
         detections = []
+
+        confidence_map = {
+            "l": "low",
+            "n": "nominal",
+            "h": "high",
+            "low": "low",
+            "nominal": "nominal",
+            "high": "high"
+        }
 
         for row in reader:
             try:
                 latitude = float(row["latitude"])
                 longitude = float(row["longitude"])
-            except (ValueError, KeyError):
+            except (ValueError, KeyError, TypeError):
                 continue
 
             regions = get_region(latitude, longitude)
@@ -128,7 +158,13 @@ def get_fires(
             if not regions:
                 continue
 
-            confidence = str(row.get("confidence", "unknown")).lower()
+            confidence_code = str(
+                row.get("confidence", "unknown")
+            ).strip().lower()
+
+            confidence = confidence_map.get(
+                confidence_code, "unknown"
+            )
 
             if min_confidence == "nominal" and confidence not in (
                 "nominal", "high"
@@ -140,7 +176,7 @@ def get_fires(
 
             try:
                 frp = float(row.get("frp") or 0)
-            except ValueError:
+            except (ValueError, TypeError):
                 frp = 0
 
             detections.append({
@@ -165,7 +201,7 @@ def get_fires(
             "retrieved_at_utc": datetime.now(
                 timezone.utc
             ).isoformat(),
-            "regional_assignment": "Approximate rectangular boundaries",
+            "regional_assignment": "Approximate rectangular boundaries; regional counts may overlap",
             "detections": detections
         }
 
@@ -175,14 +211,15 @@ def get_fires(
             detail=f"NASA FIRMS returned HTTP {error.code}."
         )
 
-    except Exception as error:
+    except HTTPException:
+        raise
+
+    except Exception:
         raise HTTPException(
             status_code=502,
             detail="NASA FIRMS request failed. Check server logs."
         )
 
-
-@app.get("/api/fires/summary")
 def fire_summary(
     days: int = Query(default=1, ge=1, le=5),
     satellite: str = Query(default="NOAA21")
